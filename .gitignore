@@ -1,0 +1,5 @@
+pngencoder
+*.o
+lena_std.png
+.cproject
+.project
