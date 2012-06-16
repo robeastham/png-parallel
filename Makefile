@@ -1,4 +1,4 @@
-CXXFLAGS =	-O2 -g -Wall -fmessage-length=0 -I/usr/include/ImageMagick
+CXXFLAGS =	-O3 -g -Wall -fmessage-length=0 -fopenmp -I/usr/include/ImageMagick
 
 OBJS =		pngencoder.o
 
