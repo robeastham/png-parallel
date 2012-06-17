@@ -105,16 +105,18 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 		pixels_op = pixels_row;
 		for (int j = 0; j < width; j++) {
 
+#if MAGICK_PIXEL_BGRA
 			//swap red and blue in BGRA mode
 			color_tmp = pixels_op->red;
 			pixels_op->red = pixels_op->blue;
 			pixels_op->blue = color_tmp;
+#endif
 
 			//change opacity
 			pixels_op->opacity = TransparentOpacity;
 			pixels_op += 1;
 		}
-		rows[i] = (char*)png_malloc(png_ptr, color_format_bpp * width + 1);
+		rows[i] = (char*) png_malloc(png_ptr, color_format_bpp * width + 1);
 		memcpy(&rows[i][0], &filter_byte, 1);
 		memcpy(&rows[i][1], pixels_row, color_format_bpp * width);
 	}
@@ -124,82 +126,123 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 	png_write_info(png_ptr, info_ptr);
 
 	//Compress the pixels
-	int ret, flush, row;
+	int ret, flush, row, stop_at_row;
 	unsigned have;
-	z_stream strm;
-	stringstream compressed_image;
+	int total_deflate_output_size = 0;
+	unsigned long adler32_combined = 0L;
+	int num_threads = 4;
+	omp_set_num_threads(num_threads);
+	z_stream z_streams[num_threads];
 	int chunk_size = 16384;
 	unsigned char output_buffer[chunk_size];
-	size_t deflate_output_size;
-	char *deflate_output;
-	FILE *deflate_stream = open_memstream(&deflate_output, &deflate_output_size);
+	size_t deflate_output_size[num_threads];
+	char *deflate_output[num_threads];
 
-	//allocate deflate state
-	strm.zalloc = Z_NULL;
-	strm.zfree = Z_NULL;
-	strm.opaque = Z_NULL;
-	if (deflateInit(&strm, Z_SYNC_FLUSH) != Z_OK) {
-		cout << "Not enough memory for compression" << endl;
+	#pragma omp parallel for private(row, stop_at_row, have, ret, flush, output_buffer)
+	for (int thread_num = 0; thread_num < num_threads; thread_num++) {
+
+		cout << "processed by thread number " << omp_get_thread_num() << endl;
+		FILE *deflate_stream = open_memstream(&deflate_output[thread_num], &deflate_output_size[thread_num]);
+
+		//allocate deflate state
+		z_streams[thread_num].zalloc = Z_NULL;
+		z_streams[thread_num].zfree = Z_NULL;
+		z_streams[thread_num].opaque = Z_NULL;
+		if (deflateInit(&z_streams[thread_num], 9) != Z_OK) {
+			cout << "Not enough memory for compression" << endl;
+		}
+
+		//compress until there are no more pixels left to process
+		row = thread_num * (int)ceil((double)height / (double)num_threads);
+		stop_at_row = (int)ceil((double)height / (double)num_threads) * (thread_num + 1);
+		stop_at_row = stop_at_row > height ? height : stop_at_row;
+		cout << "start at: " << row << "  stop at: " << stop_at_row << endl;
+		//adler32_check = adler32(adler, buf, len)
+
+		do {
+
+			//let's compress line by line so the input buffer is the number of bytes of one pixel row plus the filter byte
+			z_streams[thread_num].avail_in = color_format_bpp * width + 1;
+
+			//flush the stream if it's the last pixel row
+			flush = row == (height - 1) ? Z_FINISH : Z_SYNC_FLUSH;
+
+			z_streams[thread_num].next_in = (Bytef*) rows[row];
+			//run deflate() on input until output buffer not full, finish compression if all of source has been read in
+			do {
+				z_streams[thread_num].avail_out = chunk_size;
+				z_streams[thread_num].next_out = output_buffer;
+				ret = deflate(&z_streams[thread_num], flush);
+				assert(ret != Z_STREAM_ERROR);
+				have = chunk_size - z_streams[thread_num].avail_out;
+				fwrite(&output_buffer, 1, have, deflate_stream);
+			} while (z_streams[thread_num].avail_out == 0);
+			assert(z_streams[thread_num].avail_in == 0);
+			row++;
+		} while (row < stop_at_row);
+
+		if (row == height)
+			assert(ret == Z_STREAM_END);
+
+		fclose(deflate_stream);
+
+		total_deflate_output_size += deflate_output_size[thread_num];
+
+		//calculate the combined adler32 checksum
+		int input_length = (stop_at_row - (thread_num * (height / num_threads))) * (color_format_bpp * width + 1);
+		adler32_combined = adler32_combine(adler32_combined, z_streams[thread_num].adler, input_length);
+
+		//finish deflate process
+		(void) deflateEnd(&z_streams[thread_num]);
+
 	}
 
-	//compress until there are no more pixels left to process
-	row = 0;
-	do {
 
-		//let's compress line by line so the input buffer is the number of bytes of one pixel row plus the filter byte
-		strm.avail_in = color_format_bpp * width + 1;
+	//concatenate the z_streams
+	png_byte *IDAT_data = new png_byte[total_deflate_output_size];
+	for (int i = 0; i < num_threads; i++) {
+		if(i == 0) {
+			memcpy(IDAT_data, deflate_output[i], deflate_output_size[i]);
+			IDAT_data += deflate_output_size[i];
+		} else {
+			//strip the zlib stream header
+			memcpy(IDAT_data, deflate_output[i] + 2, deflate_output_size[i] - 2);
+			IDAT_data += (deflate_output_size[i] - 2);
+			total_deflate_output_size -= 2;
+		}
+	}
 
-		//flush the stream if it's the last pixel row
-		flush = row == (height - 1) ? Z_FINISH : Z_SYNC_FLUSH;
-		strm.next_in = (Bytef*) rows[row];
-		//run deflate() on input until output buffer not full, finish compression if all of source has been read in
-		do {
-			strm.avail_out = chunk_size;
-			strm.next_out = output_buffer;
-			ret = deflate(&strm, flush);
-			assert(ret != Z_STREAM_ERROR);
-			have = chunk_size - strm.avail_out;
-			if (fwrite(&output_buffer, 1, have, deflate_stream) != have || ferror(deflate_stream)) {
-				(void) deflateEnd(&strm);
-			}
-		} while (strm.avail_out == 0);
-		assert(strm.avail_in == 0);
-
-		row++;
-	} while (flush != Z_FINISH);
-	assert(ret == Z_STREAM_END);
-
-	fflush(deflate_stream);
-
-	cout << deflate_output_size << endl;
-	//finish deflate process
-	(void) deflateEnd(&strm);
+	//add the combined adler32 checksum
+	IDAT_data -= sizeof(adler32_combined);
+	memcpy(IDAT_data, &adler32_combined, sizeof(adler32_combined));
+	IDAT_data -= (total_deflate_output_size - sizeof(adler32_combined));
 
 	//We have to tell libpng that an IDAT was written to the file
 	png_ptr->mode |= PNG_HAVE_IDAT;
 
 	//Create an IDAT chunk
 	png_unknown_chunk idat_chunks[1];
-	strcpy((png_charp)idat_chunks[0].name, "IDAT");
-	idat_chunks[0].data = (png_byte*)deflate_output;
-	idat_chunks[0].size = deflate_output_size;
+	strcpy((png_charp) idat_chunks[0].name, "IDAT");
+	idat_chunks[0].data = IDAT_data;
+	idat_chunks[0].size = total_deflate_output_size;
 	idat_chunks[0].location = PNG_AFTER_IDAT;
 	png_ptr->flags |= PNG_FLAG_KEEP_UNSAFE_CHUNKS;
 	png_set_unknown_chunks(png_ptr, info_ptr, idat_chunks, 1);
 	png_set_unknown_chunk_location(png_ptr, info_ptr, 0, PNG_AFTER_IDAT);
 
-
 	//Write the rest of the file
 	png_write_end(png_ptr, info_ptr);
-	fclose(deflate_stream);
+
 	//Cleanup
 	png_destroy_write_struct(&png_ptr, &info_ptr);
 	for (int i = 0; i < height; ++i) {
 		png_free(png_ptr, rows[i]);
 	}
 	png_free(png_ptr, rows);
+	cout << " asdfasdfasdfasdfasdfas " << endl;
 
 }
+
 
 int main(int argc, char *argv[]) {
 
