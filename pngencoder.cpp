@@ -141,7 +141,6 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 	#pragma omp parallel for private(row, stop_at_row, have, ret, flush, output_buffer)
 	for (int thread_num = 0; thread_num < num_threads; thread_num++) {
 
-		cout << "processed by thread number " << omp_get_thread_num() << endl;
 		FILE *deflate_stream = open_memstream(&deflate_output[thread_num], &deflate_output_size[thread_num]);
 
 		//allocate deflate state
@@ -156,10 +155,8 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 		row = thread_num * (int)ceil((double)height / (double)num_threads);
 		stop_at_row = (int)ceil((double)height / (double)num_threads) * (thread_num + 1);
 		stop_at_row = stop_at_row > height ? height : stop_at_row;
-		cout << "start at: " << row << "  stop at: " << stop_at_row << endl;
-		//adler32_check = adler32(adler, buf, len)
-
-		do {
+		time_t begin = clock();
+		for(; row < stop_at_row; row++) {
 
 			//let's compress line by line so the input buffer is the number of bytes of one pixel row plus the filter byte
 			z_streams[thread_num].avail_in = color_format_bpp * width + 1;
@@ -173,19 +170,17 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 				z_streams[thread_num].avail_out = chunk_size;
 				z_streams[thread_num].next_out = output_buffer;
 				ret = deflate(&z_streams[thread_num], flush);
-				assert(ret != Z_STREAM_ERROR);
 				have = chunk_size - z_streams[thread_num].avail_out;
 				fwrite(&output_buffer, 1, have, deflate_stream);
+				//cout << "In do while of thread " << omp_get_thread_num() <<  ": " << row << endl;
 			} while (z_streams[thread_num].avail_out == 0);
-			assert(z_streams[thread_num].avail_in == 0);
-			row++;
-		} while (row < stop_at_row);
 
-		if (row == height)
-			assert(ret == Z_STREAM_END);
+		};
+
+		time_t end = clock();
+		cout << "Time elapsed do while of thread " << omp_get_thread_num() <<  ": " << double(diffclock(end, begin)) << " ms" << endl;
 
 		fclose(deflate_stream);
-
 		total_deflate_output_size += deflate_output_size[thread_num];
 
 		//calculate the combined adler32 checksum
@@ -196,7 +191,6 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 		(void) deflateEnd(&z_streams[thread_num]);
 
 	}
-
 
 	//concatenate the z_streams
 	png_byte *IDAT_data = new png_byte[total_deflate_output_size];
@@ -239,7 +233,6 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 		png_free(png_ptr, rows[i]);
 	}
 	png_free(png_ptr, rows);
-	cout << " asdfasdfasdfasdfasdfas " << endl;
 
 }
 
