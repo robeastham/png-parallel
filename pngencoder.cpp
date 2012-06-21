@@ -19,18 +19,22 @@ typedef unsigned short u16;
 #include <Magick++/Image.h>
 #include <Magick++/Pixels.h>
 #include <png.h>
-#include <math.h>
 #include <time.h>
-#include <bits/time.h>
 #include <omp.h>
 #include <zlib.h>
-#include <stdio.h>
+#include "debug.h"
 
 using namespace std;
 using namespace Magick;
-using namespace boost::interprocess;
 namespace po = boost::program_options;
-#define PNG_FLAG_KEEP_UNSAFE_CHUNKS       0x10000L
+
+
+//Depending on the magick++ build, different amount of bytes for the pixel representation is used
+#if QuantumDepth==8
+	int COLOR_FORMAT_BPP = 4;
+#elif QuantumDepth==16
+	int COLOR_FORMAT_BPP = 8;
+#endif
 
 double diffclock(clock_t clock1, clock_t clock2) {
 	double diffticks = clock1 - clock2;
@@ -50,6 +54,52 @@ void png_write(png_structp png_ptr, png_bytep data, png_size_t length) {
 void png_flush(png_structp png_ptr) {
 	ofstream* file = (ofstream*) png_get_io_ptr(png_ptr);
 	file->flush();
+}
+
+PixelPacket* png_filter_row(PixelPacket* pixels, int row_length) {
+
+	unsigned short color_tmp;
+	char filter_byte = 0;
+
+	//transformations
+	for (int j = 0; j < row_length; j++) {
+		//swap red and blue in BGRA mode
+		color_tmp = pixels->red;
+		pixels->red = pixels->blue;
+		pixels->blue = color_tmp;
+
+		//change opacity
+		pixels->opacity = TransparentOpacity;
+		pixels += 1;
+	}
+	pixels -= row_length;
+
+	//add filter byte 0 to disable row filtering
+	PixelPacket* filtered_row = (PixelPacket*) malloc(row_length * COLOR_FORMAT_BPP + 1);
+	memcpy(&((char*)filtered_row)[0], &filter_byte, 1);
+	memcpy(&((char*)filtered_row)[1], pixels, COLOR_FORMAT_BPP * row_length);
+
+	return filtered_row;
+
+}
+
+PixelPacket* png_filter_rows(PixelPacket* pixels, int rows, int row_length) {
+
+	int bytes_per_row = (COLOR_FORMAT_BPP * row_length + 1);
+	PixelPacket* filtered_rows = (PixelPacket*) malloc(rows * bytes_per_row);
+	PixelPacket* filtered_row;
+
+	for(int row = 0; row < rows; row++) {
+		filtered_row = png_filter_row(pixels, row_length);
+		memcpy((char*)filtered_rows, filtered_row, bytes_per_row);
+		pixels += row_length;
+		filtered_rows = (PixelPacket*)((char*)filtered_rows + bytes_per_row);
+	}
+
+	filtered_rows = (PixelPacket*)((char*)filtered_rows - (bytes_per_row * rows));
+
+	return filtered_rows;
+
 }
 
 void png_encode(Image::Image &input_file, ofstream &output_file) {
@@ -75,6 +125,7 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 	//Change from RGB to BGR as Magick++ uses this format
 	png_set_bgr(png_ptr);
 
+	//For the sake of simplicity we do not apply any filters to a scanline
 	png_set_filter(png_ptr, 0, PNG_FILTER_NONE);
 
 	//Write IHDR chunk
@@ -84,63 +135,34 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 	png_set_IHDR(png_ptr, info_ptr, width, height, QuantumDepth, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
 			PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_BASE);
 
-	//Depending on the magick++ build, different amount of bytes for the pixel representation is used
-#if QuantumDepth==8
-	int color_format_bpp = 4;
-#elif QuantumDepth==16
-	int color_format_bpp = 8;
-#endif
-
-	//Build rows
-	PixelPacket* pixels = input_file.getPixels(0, 0, width, height);
-	char** rows = (char**) png_malloc(png_ptr, (height * color_format_bpp * width) + height);
-	PixelPacket* pixels_row;
-	PixelPacket* pixels_op;
-	short color_tmp;
-	char filter_byte = 0;
-
-	//#pragma omp parallel for private(pixels_row,pixels_op) shared(height,width,rows,pixels,color_format_bpp,png_ptr)
-	for (int i = 0; i < height; i++) {
-		pixels_row = pixels + i * width;
-		pixels_op = pixels_row;
-		for (int j = 0; j < width; j++) {
-
-#if MAGICK_PIXEL_BGRA
-			//swap red and blue in BGRA mode
-			color_tmp = pixels_op->red;
-			pixels_op->red = pixels_op->blue;
-			pixels_op->blue = color_tmp;
-#endif
-
-			//change opacity
-			pixels_op->opacity = TransparentOpacity;
-			pixels_op += 1;
-		}
-		rows[i] = (char*) png_malloc(png_ptr, color_format_bpp * width + 1);
-		memcpy(&rows[i][0], &filter_byte, 1);
-		memcpy(&rows[i][1], pixels_row, color_format_bpp * width);
-	}
-	png_set_rows(png_ptr, info_ptr, (png_bytepp) rows);
-
 	//Write the file header information.
 	png_write_info(png_ptr, info_ptr);
 
 	//Compress the pixels
-	int ret, flush, row, stop_at_row;
-	unsigned have;
 	int total_deflate_output_size = 0;
 	unsigned long adler32_combined = 0L;
-	int num_threads = 4;
+	const int num_threads = 4;
 	omp_set_num_threads(num_threads);
 	z_stream z_streams[num_threads];
-	int chunk_size = 16384;
-	unsigned char output_buffer[chunk_size];
+
 	size_t deflate_output_size[num_threads];
 	char *deflate_output[num_threads];
 
-	#pragma omp parallel for private(row, stop_at_row, have, ret, flush, output_buffer)
+	#pragma omp parallel for default(shared)
 	for (int thread_num = 0; thread_num < num_threads; thread_num++) {
 
+		int ret, flush, row, stop_at_row;
+		unsigned int have;
+		const int chunk_size = 16384;
+		unsigned char output_buffer[chunk_size];
+
+		//calculate which lines have to be handled by this thread
+		row = thread_num * (int)ceil((double)height / (double)num_threads);
+		stop_at_row = (int)ceil((double)height / (double)num_threads) * (thread_num + 1);
+		stop_at_row = stop_at_row > height ? height : stop_at_row;
+
+		//Load all pixel data
+		PixelPacket* pixels = input_file.getPixels(0, row, width, stop_at_row - row);
 		FILE *deflate_stream = open_memstream(&deflate_output[thread_num], &deflate_output_size[thread_num]);
 
 		//allocate deflate state
@@ -152,39 +174,36 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 		}
 
 		//compress until there are no more pixels left to process
-		row = thread_num * (int)ceil((double)height / (double)num_threads);
-		stop_at_row = (int)ceil((double)height / (double)num_threads) * (thread_num + 1);
-		stop_at_row = stop_at_row > height ? height : stop_at_row;
-		time_t begin = clock();
-		for(; row < stop_at_row; row++) {
+		PixelPacket *filtered_rows = png_filter_rows(pixels, stop_at_row - row, width);
 
-			//let's compress line by line so the input buffer is the number of bytes of one pixel row plus the filter byte
-			z_streams[thread_num].avail_in = color_format_bpp * width + 1;
+//		time_t begin = clock();
+		//filtered_row = png_filter_row(pixels, width);
 
-			//flush the stream if it's the last pixel row
-			flush = row == (height - 1) ? Z_FINISH : Z_SYNC_FLUSH;
+		//let's compress line by line so the input buffer is the number of bytes of one pixel row plus the filter byte
+		z_streams[thread_num].avail_in = (COLOR_FORMAT_BPP * width + 1) * (stop_at_row - row);
+		z_streams[thread_num].avail_in += stop_at_row == height ? 1 : 0;
 
-			z_streams[thread_num].next_in = (Bytef*) rows[row];
-			//run deflate() on input until output buffer not full, finish compression if all of source has been read in
-			do {
-				z_streams[thread_num].avail_out = chunk_size;
-				z_streams[thread_num].next_out = output_buffer;
-				ret = deflate(&z_streams[thread_num], flush);
-				have = chunk_size - z_streams[thread_num].avail_out;
-				fwrite(&output_buffer, 1, have, deflate_stream);
-				//cout << "In do while of thread " << omp_get_thread_num() <<  ": " << row << endl;
-			} while (z_streams[thread_num].avail_out == 0);
+		//flush the stream if it's the last pixel row
+		flush = stop_at_row == height ? Z_FINISH : Z_SYNC_FLUSH;
+		z_streams[thread_num].next_in = (Bytef*)filtered_rows;
 
-		};
+		//run deflate() on input until output buffer not full, finish compression if all of source has been read in
+		do {
+			z_streams[thread_num].avail_out = chunk_size;
+			z_streams[thread_num].next_out = output_buffer;
+			ret = deflate(&z_streams[thread_num], flush);
+			have = chunk_size - z_streams[thread_num].avail_out;
+			fwrite(&output_buffer, 1, have, deflate_stream);
+		} while (z_streams[thread_num].avail_out == 0);
 
-		time_t end = clock();
-		cout << "Time elapsed do while of thread " << omp_get_thread_num() <<  ": " << double(diffclock(end, begin)) << " ms" << endl;
+//		time_t end = clock();
+//		cout << "Compression of row " << row << " to " << stop_at_row << " in thread " << omp_get_thread_num() <<  ": " << double(diffclock(end, begin)) << " ms" << endl;
 
 		fclose(deflate_stream);
 		total_deflate_output_size += deflate_output_size[thread_num];
 
 		//calculate the combined adler32 checksum
-		int input_length = (stop_at_row - (thread_num * (height / num_threads))) * (color_format_bpp * width + 1);
+		int input_length = (stop_at_row - (thread_num * (height / num_threads))) * (COLOR_FORMAT_BPP * width + 1);
 		adler32_combined = adler32_combine(adler32_combined, z_streams[thread_num].adler, input_length);
 
 		//finish deflate process
@@ -220,7 +239,7 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 	idat_chunks[0].data = IDAT_data;
 	idat_chunks[0].size = total_deflate_output_size;
 	idat_chunks[0].location = PNG_AFTER_IDAT;
-	png_ptr->flags |= PNG_FLAG_KEEP_UNSAFE_CHUNKS;
+	png_ptr->flags |= 0x10000L; //PNG_FLAG_KEEP_UNSAFE_CHUNKS
 	png_set_unknown_chunks(png_ptr, info_ptr, idat_chunks, 1);
 	png_set_unknown_chunk_location(png_ptr, info_ptr, 0, PNG_AFTER_IDAT);
 
@@ -229,10 +248,6 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 
 	//Cleanup
 	png_destroy_write_struct(&png_ptr, &info_ptr);
-	for (int i = 0; i < height; ++i) {
-		png_free(png_ptr, rows[i]);
-	}
-	png_free(png_ptr, rows);
 
 }
 
