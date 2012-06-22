@@ -22,7 +22,6 @@ typedef unsigned short u16;
 #include <time.h>
 #include <omp.h>
 #include <zlib.h>
-#include "debug.h"
 
 using namespace std;
 using namespace Magick;
@@ -61,7 +60,7 @@ PixelPacket* png_filter_row(PixelPacket* pixels, int row_length) {
 	unsigned short color_tmp;
 	char filter_byte = 0;
 
-	//transformations
+	//Transformations
 	for (int j = 0; j < row_length; j++) {
 		//swap red and blue in BGRA mode
 		color_tmp = pixels->red;
@@ -74,7 +73,7 @@ PixelPacket* png_filter_row(PixelPacket* pixels, int row_length) {
 	}
 	pixels -= row_length;
 
-	//add filter byte 0 to disable row filtering
+	//Add filter byte 0 to disable row filtering
 	PixelPacket* filtered_row = (PixelPacket*) malloc(row_length * COLOR_FORMAT_BPP + 1);
 	memcpy(&((char*)filtered_row)[0], &filter_byte, 1);
 	memcpy(&((char*)filtered_row)[1], pixels, COLOR_FORMAT_BPP * row_length);
@@ -138,13 +137,12 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 	//Write the file header information.
 	png_write_info(png_ptr, info_ptr);
 
-	//Compress the pixels
+	//Init vars used for compression
 	int total_deflate_output_size = 0;
 	unsigned long adler32_combined = 0L;
 	const int num_threads = 4;
 	omp_set_num_threads(num_threads);
 	z_stream z_streams[num_threads];
-
 	size_t deflate_output_size[num_threads];
 	char *deflate_output[num_threads];
 
@@ -153,10 +151,10 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 
 		int ret, flush, row, stop_at_row;
 		unsigned int have;
-		const int chunk_size = 16384;
+		const int chunk_size = 128;
 		unsigned char output_buffer[chunk_size];
 
-		//calculate which lines have to be handled by this thread
+		//Calculate which lines have to be handled by this thread
 		row = thread_num * (int)ceil((double)height / (double)num_threads);
 		stop_at_row = (int)ceil((double)height / (double)num_threads) * (thread_num + 1);
 		stop_at_row = stop_at_row > height ? height : stop_at_row;
@@ -165,7 +163,7 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 		PixelPacket* pixels = input_file.getPixels(0, row, width, stop_at_row - row);
 		FILE *deflate_stream = open_memstream(&deflate_output[thread_num], &deflate_output_size[thread_num]);
 
-		//allocate deflate state
+		//Allocate deflate state
 		z_streams[thread_num].zalloc = Z_NULL;
 		z_streams[thread_num].zfree = Z_NULL;
 		z_streams[thread_num].opaque = Z_NULL;
@@ -173,21 +171,20 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 			cout << "Not enough memory for compression" << endl;
 		}
 
-		//compress until there are no more pixels left to process
+		//Add the filter byte and reorder the RGB values
 		PixelPacket *filtered_rows = png_filter_rows(pixels, stop_at_row - row, width);
 
-//		time_t begin = clock();
-		//filtered_row = png_filter_row(pixels, width);
-
-		//let's compress line by line so the input buffer is the number of bytes of one pixel row plus the filter byte
+		//Let's compress line by line so the input buffer is the number of bytes of one pixel row plus the filter byte
 		z_streams[thread_num].avail_in = (COLOR_FORMAT_BPP * width + 1) * (stop_at_row - row);
 		z_streams[thread_num].avail_in += stop_at_row == height ? 1 : 0;
 
-		//flush the stream if it's the last pixel row
+		//Finish the stream if it's the last pixel row
 		flush = stop_at_row == height ? Z_FINISH : Z_SYNC_FLUSH;
 		z_streams[thread_num].next_in = (Bytef*)filtered_rows;
 
-		//run deflate() on input until output buffer not full, finish compression if all of source has been read in
+		time_t begin = clock();
+
+		//Compress the image data with deflate
 		do {
 			z_streams[thread_num].avail_out = chunk_size;
 			z_streams[thread_num].next_out = output_buffer;
@@ -196,22 +193,22 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 			fwrite(&output_buffer, 1, have, deflate_stream);
 		} while (z_streams[thread_num].avail_out == 0);
 
-//		time_t end = clock();
-//		cout << "Compression of row " << row << " to " << stop_at_row << " in thread " << omp_get_thread_num() <<  ": " << double(diffclock(end, begin)) << " ms" << endl;
+		time_t end = clock();
+		cout << "Compression of row " << row << " to " << stop_at_row << " in thread " << omp_get_thread_num() <<  ": " << double(diffclock(end, begin)) << " ms" << endl;
 
 		fclose(deflate_stream);
 		total_deflate_output_size += deflate_output_size[thread_num];
 
-		//calculate the combined adler32 checksum
+		//Calculate the combined adler32 checksum
 		int input_length = (stop_at_row - (thread_num * (height / num_threads))) * (COLOR_FORMAT_BPP * width + 1);
 		adler32_combined = adler32_combine(adler32_combined, z_streams[thread_num].adler, input_length);
 
-		//finish deflate process
+		//Finish deflate process
 		(void) deflateEnd(&z_streams[thread_num]);
 
 	}
 
-	//concatenate the z_streams
+	//Concatenate the z_streams
 	png_byte *IDAT_data = new png_byte[total_deflate_output_size];
 	for (int i = 0; i < num_threads; i++) {
 		if(i == 0) {
@@ -225,7 +222,7 @@ void png_encode(Image::Image &input_file, ofstream &output_file) {
 		}
 	}
 
-	//add the combined adler32 checksum
+	//Add the combined adler32 checksum
 	IDAT_data -= sizeof(adler32_combined);
 	memcpy(IDAT_data, &adler32_combined, sizeof(adler32_combined));
 	IDAT_data -= (total_deflate_output_size - sizeof(adler32_combined));
