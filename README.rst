@@ -10,8 +10,10 @@ Feel free to use, enhance or whatever.
 
 Requirements
 ------------
-- zlib-dev
+- libboost-program-options-dev
+- libmagick++-dev
 - libpng-dev
+- zlib-dev
 
 
 Compilation
