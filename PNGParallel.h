@@ -37,7 +37,6 @@ using namespace Magick;
 class PNGParallel {
 public:
 	PNGParallel(Image::Image &inputFile);
-	PNGParallel(string inputPath);
 	void setNumThreads(int threads);
 	void setCompressionLevel(int compressionLevel);
 	void compress(ofstream &outputFile);
