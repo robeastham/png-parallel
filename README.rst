@@ -3,7 +3,7 @@ Parallelized PNG encoder using OpenMP and libpng
 
 This is a parallelized PNG encoder written in C++ using OpenMP and libpng. 
 
-**This application has to be seen as proof of concept as it was developed for a seminar paper during my study.**
+**This application has to be seen as a proof of concept as it was developed for a seminar paper during my study.**
 
 Feel free to use, enhance or whatever.
 
