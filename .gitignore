@@ -1,5 +1,6 @@
 pngencoder
 *.o
-lena_std.png
+*.png
 .cproject
 .project
+.pydevproject
